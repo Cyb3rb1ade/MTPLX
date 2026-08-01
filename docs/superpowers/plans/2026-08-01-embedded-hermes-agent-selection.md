@@ -722,7 +722,7 @@ Expected: zero failures and no new warnings attributable to the Hermes feature.
 Run:
 
 ```bash
-DEVELOPER_DIR=/Volumes/nugly/Applications/Xcode.app \
+DEVELOPER_DIR=/Volumes/nugly/Applications/Xcode-beta.app \
   apps/MTPLXApp/script/build_and_run.sh --no-launch
 ```
 
@@ -755,7 +755,7 @@ Run: `cd apps/MTPLXApp && swift test`
 Run:
 
 ```bash
-DEVELOPER_DIR=/Volumes/nugly/Applications/Xcode.app \
+DEVELOPER_DIR=/Volumes/nugly/Applications/Xcode-beta.app \
   apps/MTPLXApp/script/build_and_run.sh --no-launch
 ```
 
