@@ -28,6 +28,7 @@ import re
 import secrets
 import socket
 import subprocess
+import struct
 import sys
 import time
 import urllib.parse
@@ -92,6 +93,7 @@ from mtplx.gemma4_pair import (
     resolve_gemma4_pair_paths,
 )
 from mtplx.model_scheduler import ModelWorkScheduler
+from mtplx.retrieval import RetrievalError
 from mtplx.sampling import SamplerConfig
 from mtplx.profiles import (
     DEFAULT_HF_MODEL_ID,
@@ -110,6 +112,7 @@ from mtplx.runtime_options import (
     resolve_api_key,
 )
 from mtplx.draft_lm_head import _install_draft_lm_head
+from mtplx import request_capture
 from mtplx.fan_mode import (
     FAN_MODE_CHOICES,
     FAN_MODE_DEFAULT,
@@ -305,8 +308,15 @@ STREAM_SILENCE_WARN_INTERVAL_S = 60.0
 STREAM_STALL_DEADLINE_S = float(
     os.environ.get("MTPLX_STREAM_STALL_DEADLINE_S") or 300.0
 )
-STREAM_HIDDEN_TOOL_GUARD_TOKENS = 2048
-STREAM_HIDDEN_TOOL_GUARD_S = 30.0
+# Runaway-hidden-generation backstop. Native-tool agent workloads stream
+# multi-thousand-token arguments (whole files) as legitimate hidden text, so
+# the ceilings are env-tunable; the defaults keep the original chat-UX guard.
+STREAM_HIDDEN_TOOL_GUARD_TOKENS = int(
+    os.environ.get("MTPLX_STREAM_HIDDEN_TOOL_GUARD_TOKENS", "2048")
+)
+STREAM_HIDDEN_TOOL_GUARD_S = float(
+    os.environ.get("MTPLX_STREAM_HIDDEN_TOOL_GUARD_S", "30")
+)
 STREAM_TOOL_CALL_FINISH_GRACE_S = 0.05
 TOOL_PROTOCOL_BOUNDARY_GRACE_S = 0.05
 _REASONING_DETAILS_RE = re.compile(
@@ -1041,6 +1051,28 @@ class CompletionRequest(BaseModel):
     stream: bool = False
 
 
+class EmbeddingsRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    model: str | None = None
+    input: str | list[str] | None = None
+    encoding_format: str | None = None
+    # Qwen3-Embedding scores queries better when they carry a task instruction,
+    # while stored documents must stay raw — so this is per request, not global.
+    instruction: str | None = None
+
+
+class RerankRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    model: str | None = None
+    query: str | None = None
+    documents: list[str] | None = None
+    top_n: int | None = None
+    return_documents: bool = False
+    instruction: str | None = None
+
+
 class AnthropicMessage(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -1073,6 +1105,15 @@ class AnthropicMessagesRequest(BaseModel):
 
 def _startup_line(text: str = "") -> None:
     _safe_stdout_print(text)
+
+
+def _laguna_fused_startup_line(runtime: Any) -> str | None:
+    """Engagement receipt for the env-gated fused stack (grep: [laguna-fused])."""
+
+    report = getattr(runtime, "laguna_fused_report", None)
+    if not report:
+        return None
+    return "[5/6] [laguna-fused] " + json.dumps(report, ensure_ascii=False)
 
 
 def _startup_server_url(args: argparse.Namespace) -> str:
@@ -1613,6 +1654,11 @@ class ServerState:
             raise ValueError(str(exc)) from exc
         apply_paged_kv_quantization_env(args.paged_kv_quantization)
         self.model_id = args.model_id
+        # Retrieval models are independent of the MTP generation path: they are
+        # loaded on first use and may be absent entirely.
+        from mtplx.retrieval import registry_from_args
+
+        self.retrieval = registry_from_args(args)
         self.started_at_s = time.time()
         self.lock = Lock()
         self.foreground_lock = Lock()
@@ -1758,6 +1804,9 @@ class ServerState:
             _startup_line(
                 f"[5/6] {self.backend_descriptor.display_name} drafter is active"
             )
+        fused_line = _laguna_fused_startup_line(self.runtime)
+        if fused_line:
+            _startup_line(fused_line)
         if self.backend_descriptor.uses_draft_lm_head and self.runtime.mtp_enabled:
             self.draft_lm_head = self.model_scheduler.submit_foreground(
                 _install_draft_lm_head,
@@ -1886,7 +1935,8 @@ class ServerState:
         from mtplx.thermal import SmartFanController
 
         self.smart_fans = SmartFanController(
-            log=lambda line: LOGGER.info("%s", line)
+            log=lambda line: LOGGER.info("%s", line),
+            activity_probe=self._smart_fan_activity_probe,
         )
         # Dashboard primitives: pub/sub bus, in-flight registry, 5-min rolling
         # TPS window, lifetime counters, prefill history. Created before
@@ -1895,6 +1945,29 @@ class ServerState:
         self.dashboard = DashboardState()
         self.ar_batch_service = _BatchedARGenerationService(self)
         self.warmup_status = _run_startup_warmup(self)
+
+    def _smart_fan_activity_probe(self) -> bool:
+        """True while any model work is executing, queued, or recently active.
+
+        Feeds the SmartFanController stale-lease reconciler (#201). Covers
+        every legitimate work state: foreground generation (begin/end_foreground
+        wraps dispatch on all paths including the AR batch service), scheduler
+        queues and the executing item of either lane (foreground + idle
+        postcommit), and a short recency window so back-to-back agent turns
+        never look idle between requests.
+        """
+        if self.has_foreground():
+            return True
+        scheduler = getattr(self, "model_scheduler", None)
+        if scheduler is not None and hasattr(scheduler, "any_pending_or_active"):
+            try:
+                if scheduler.any_pending_or_active():
+                    return True
+            except BaseException:
+                return True
+        last_started = float(getattr(self, "last_request_started_at", 0.0) or 0.0)
+        last_finished = float(getattr(self, "last_request_at", 0.0) or 0.0)
+        return (time.time() - max(last_started, last_finished)) < 30.0
 
     def begin_foreground(self) -> None:
         with self.foreground_lock:
@@ -6353,6 +6426,137 @@ def _parse_poolside_tool_call(block: str) -> tuple[str, Any] | None:
     return name, arguments
 
 
+def _scan_bracket_tool_call(
+    text: str,
+    start: int,
+) -> tuple[int, str, Any] | None:
+    """Balanced-scan one `[Calling tool: name({...})]` block at `start`.
+
+    The JSON object is walked with string/escape awareness, so `}` or `)]`
+    sequences inside argument strings (a JS file body, a task_progress
+    checklist) cannot end the block early — the failure mode of the
+    non-greedy regex this replaces. Returns (end_exclusive, name, arguments)
+    for a complete block, or None when no complete well-formed block starts
+    at `start`.
+    """
+    match = re.compile(
+        r"\[(?:Calling tool|Tool call):\s*([A-Za-z_][\w.-]*)\s*\(",
+        re.IGNORECASE,
+    ).match(text, start)
+    if match is None:
+        return None
+    name = match.group(1)
+    i = match.end()
+    tail = re.compile(r"\s*\)\s*\]").match(text, i)
+    if tail is not None:
+        return tail.end(), name, {}
+    if i >= len(text) or text[i] != "{":
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    j = i
+    while j < len(text):
+        ch = text[j]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                j += 1
+                break
+        j += 1
+    if depth != 0:
+        return None
+    close = re.compile(r"\s*\)\s*\]").match(text, j)
+    if close is None:
+        return None
+    try:
+        arguments = json.loads(text[i:j])
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(arguments, dict):
+        return None
+    return close.end(), name, arguments
+
+
+def _classify_bracket_tool_call(text: str, start: int) -> str:
+    """Classify the bracket block starting at `start` (which sits on a full
+    `[Calling tool:`/`[Tool call:` prefix).
+
+    'complete'   — a well-formed call the scanner can extract now.
+    'incomplete' — the available text ends inside a structurally consistent
+                   block; more chunks may complete it (streaming: buffer).
+    'invalid'    — the structure is already broken with text to spare (e.g. a
+                   dangling prefix in prose); never a call, leave it to the
+                   content path and its prefix sanitizer.
+    """
+    if _scan_bracket_tool_call(text, start) is not None:
+        return "complete"
+    tail = text[start:]
+    head = re.match(
+        r"\[(?:Calling tool|Tool call):\s*[A-Za-z_][\w.-]*\s*\(",
+        tail,
+        re.IGNORECASE,
+    )
+    if head is None:
+        after_prefix = re.sub(
+            r"^\[(?:Calling tool|Tool call):",
+            "",
+            tail,
+            flags=re.IGNORECASE,
+        )
+        if re.fullmatch(r"\s*(?:[A-Za-z_][\w.-]*)?\s*\(?", after_prefix):
+            return "incomplete"
+        return "invalid"
+    i = start + head.end()
+    if i >= len(text):
+        return "incomplete"
+    if text[i] != "{":
+        return (
+            "incomplete"
+            if re.fullmatch(r"\s*\)?\s*\]?", text[i:])
+            else "invalid"
+        )
+    depth = 0
+    in_string = False
+    escaped = False
+    j = i
+    while j < len(text):
+        ch = text[j]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                j += 1
+                break
+        j += 1
+    if depth != 0:
+        return "incomplete"
+    # Object closed but the scanner rejected it: either the `)]` close is
+    # still arriving, or the payload is truly malformed.
+    return "incomplete" if re.fullmatch(r"\s*\)?\s*", text[j:]) else "invalid"
+
+
 def _tool_marker_pairs_from_tokenizer(tokenizer: Any | None) -> list[tuple[str, str]]:
     if tokenizer is None:
         return []
@@ -6384,19 +6588,33 @@ def _iter_generated_tool_call_envelopes(
         )
         for match in pattern.finditer(text):
             envelopes.append((match.start(), match.end(), match.group(1).strip(), None))
-    for match in _BRACKET_TOOL_CALL_RE.finditer(text):
-        name = match.group(1).strip()
-        raw_args = (match.group(2) or "").strip()
-        if raw_args:
-            try:
-                arguments: Any = json.loads(raw_args)
-            except json.JSONDecodeError as exc:
-                raise _tool_protocol_error(
-                    f"bracket tool_call '{name}' arguments are not valid JSON"
-                ) from exc
-        else:
-            arguments = {}
-        envelopes.append((match.start(), match.end(), "", (name, arguments)))
+    # Bracket dialect (`[Calling tool: name({...})]`) via the balanced scanner:
+    # the old non-greedy regex ended the block at the first `})]`, which any
+    # code-file argument contains inside a string, so large bracket calls
+    # always failed JSON decode and fell back to prose.
+    search_from = 0
+    lowered_text = text.lower()
+    while True:
+        candidates = [
+            idx
+            for idx in (
+                lowered_text.find(prefix.lower(), search_from)
+                for prefix in _BRACKET_TOOL_PREFIXES
+            )
+            if idx >= 0
+        ]
+        if not candidates:
+            break
+        found = min(candidates)
+        scanned = _scan_bracket_tool_call(text, found)
+        if scanned is None:
+            # Unterminated or malformed: not an envelope — the text stays
+            # visible content, same terminal state as the old decode error.
+            search_from = found + 1
+            continue
+        end, name, arguments = scanned
+        envelopes.append((found, end, "", (name, arguments)))
+        search_from = end
     envelopes.sort(key=lambda item: item[0])
     for previous, current in zip(envelopes, envelopes[1:]):
         if current[0] < previous[1]:
@@ -6515,23 +6733,28 @@ def _parse_generated_tool_calls(
             raise _tool_protocol_error("unsupported tool_call payload format")
         name, arguments = parsed
         canonical_name = _canonical_tool_name_for_model_output(name, tools)
-        if canonical_name is None:
-            raise _tool_protocol_error(f"unknown tool '{name}'")
         arguments_value = _json_object_value(
             arguments,
             context=f"tool_call[{index}]",
         )
-        arguments_value = _normalize_tool_arguments_for_schema(
-            tool_name=canonical_name,
-            arguments=arguments_value,
-            tools=tools,
-        )
-        _validate_tool_arguments_for_schema(
-            tool_name=canonical_name,
-            arguments=arguments_value,
-            tools=tools,
-            context=f"tool_call[{index}]",
-        )
+        if canonical_name is None:
+            # OpenAI-compatible pass-through: surface the call under its raw
+            # name and let the client own the unknown-tool rejection (the
+            # client answers the model, which self-corrects). There is no
+            # schema to normalize or validate against.
+            canonical_name = str(name)
+        else:
+            arguments_value = _normalize_tool_arguments_for_schema(
+                tool_name=canonical_name,
+                arguments=arguments_value,
+                tools=tools,
+            )
+            _validate_tool_arguments_for_schema(
+                tool_name=canonical_name,
+                arguments=arguments_value,
+                tools=tools,
+                context=f"tool_call[{index}]",
+            )
         calls.append(
             {
                 "id": f"call_{uuid.uuid4().hex[:24]}",
@@ -6841,8 +7064,8 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
                     self._tools,
                 )
                 if canonical_name is None:
-                    self._fallback_reason = f"unknown tool '{name}'"
-                    return deltas
+                    # Pass-through: the client owns unknown-tool rejection.
+                    canonical_name = name
                 self._name = canonical_name
                 self._started = True
                 self._buf = self._buf[function_end + 1 :]
@@ -7271,12 +7494,16 @@ class _ToolAwareContentStreamTranslator:
         for prefix in _BRACKET_TOOL_PREFIXES:
             bracket_idx = lowered.find(prefix.lower())
             while bracket_idx >= 0:
-                candidate = text[bracket_idx:]
-                if _BRACKET_TOOL_CALL_RE.match(candidate):
+                # The old gate demanded a complete regex match mid-stream and
+                # skipped ahead on any early `]` (present in every
+                # task_progress checklist), so bracket-call text streamed to
+                # the client as content AND the finish-time rescue emitted the
+                # same call — a double delivery that also taught the model its
+                # drift dialect was accepted. Buffer on complete AND
+                # still-completing blocks; only structurally-dead prefixes
+                # stay on the content path for the prefix sanitizer.
+                if _classify_bracket_tool_call(text, bracket_idx) != "invalid":
                     candidates.append(bracket_idx)
-                    break
-                close_idx = candidate.find("]")
-                if close_idx < 0:
                     break
                 bracket_idx = lowered.find(prefix.lower(), bracket_idx + 1)
         for start_marker, _end_marker in self._marker_pairs:
@@ -12343,9 +12570,13 @@ def _mtplx_dashboard_snapshot(state: "ServerState") -> dict[str, Any]:
             "error": str(exc),
         }
         bank_dict = {}
+    retrieval = getattr(state, "retrieval", None)
     return {
         "ts": time.time(),
         "model_id": state.model_id,
+        # Always present, so a client can tell "no retrieval configured" apart
+        # from "this build has no retrieval support".
+        "retrieval": retrieval.status() if retrieval is not None else {"enabled": False, "models": []},
         "profile": state.profile.to_dict()
         if hasattr(state.profile, "to_dict")
         else {"name": getattr(state.profile, "name", "unknown")},
@@ -12479,6 +12710,40 @@ class _MemoryPressureGuard:
             self.prev_level = level
 
 
+async def _retrieval_idle_loop(
+    state: "ServerState", *, interval_s: float = 30.0
+) -> None:
+    """Release idle retrieval weights, then archive the session bank.
+
+    Started only when a timeout is configured. Never raises into the server:
+    a watcher that can kill the daemon is worse than one that misses a cycle.
+    """
+    retrieval = getattr(state, "retrieval", None)
+    if retrieval is None or retrieval.idle_timeout_s <= 0:
+        return
+    while True:
+        await asyncio.sleep(interval_s)
+        try:
+            released = await asyncio.to_thread(retrieval.unload_idle)
+            if released["unloaded"]:
+                _LOG.info(
+                    "retrieval idle release: %d model(s), %.2f GB",
+                    len(released["unloaded"]),
+                    released["freed_bytes"] / (1024**3),
+                )
+                # Only once nothing is resident: archiving while a retrieval
+                # model is still serving would trade one cost for another.
+                if not retrieval.status()["resident"]:
+                    try:
+                        await asyncio.to_thread(state.sessions.archive_cold_tier)
+                    except Exception as exc:
+                        _LOG.warning("session bank archive failed: %s", exc)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _LOG.warning("retrieval idle watcher: %s", exc)
+
+
 async def _memory_pressure_loop(
     state: "ServerState", *, interval_s: float = 10.0
 ) -> None:
@@ -12527,6 +12792,24 @@ async def _memory_pressure_loop(
                             else "memory_pressure_warning"
                         ),
                     )
+                if level >= 4:
+                    # Under CRITICAL, shedding the buffer pool is not enough:
+                    # retrieval weights are whole GB and reload in seconds, so
+                    # they are the cheapest large thing to give back. Idle-only
+                    # (threshold 0 means "not pinned"), so an in-flight request
+                    # never loses its model.
+                    retrieval = getattr(state, "retrieval", None)
+                    if retrieval is not None and retrieval.enabled:
+                        try:
+                            released = await asyncio.to_thread(retrieval.unload_idle, 0)
+                            if released["unloaded"]:
+                                _LOG.info(
+                                    "memory pressure released %d retrieval model(s), %.2f GB",
+                                    len(released["unloaded"]),
+                                    released["freed_bytes"] / (1024**3),
+                                )
+                        except Exception as exc:
+                            _LOG.warning("retrieval pressure release: %s", exc)
                 if evicted or level >= 4:
                     try:
                         import mlx.core as _mx
@@ -14183,6 +14466,10 @@ def _adaptive_config(
                 "decrease_after": int(args.adaptive_decrease_after),
             }
         )
+    elif policy == "cost":
+        config["marginal_ms_prior"] = float(
+            getattr(args, "adaptive_cost_marginal_ms", 7.0) or 7.0
+        )
     elif policy == "expected_value":
         configured_base_depth = max(1, int(args.adaptive_ev_base_depth))
         effective_base_depth = max(
@@ -14237,6 +14524,17 @@ def _make_adaptive_policy(
             start_depth=int(args.adaptive_start_depth),
             increase_after=int(args.adaptive_increase_after),
             decrease_after=int(args.adaptive_decrease_after),
+        )
+    if policy == "cost":
+        from mtplx.adaptive import CostModelDepthPolicy
+
+        return CostModelDepthPolicy(
+            max_depth=effective_max_depth,
+            min_depth=effective_min_depth,
+            marginal_ms=float(
+                getattr(args, "adaptive_cost_marginal_ms", 0.0) or 0.0
+            )
+            or None,
         )
     if policy == "expected_value":
         effective_base_depth = max(
@@ -15507,6 +15805,18 @@ def _finalize_batched_ar_generation(
                 ensure_ascii=False,
             )
         )
+    if request_capture.capture_dir():
+        request_capture.capture_outcome(
+            (request_observability or {}).get("request_id"),
+            {
+                "scheduler_lane": "ar_batch",
+                "completion_tokens": completion_tokens,
+                "finish_reason": generated.get("finish_reason"),
+                "resolved_seed": stats.get("server_seed"),
+                "tok_s": round(float(generated.get("tok_s") or 0.0), 3),
+                **request_capture.clip_text_head_tail(generated.get("text") or ""),
+            },
+        )
     return generated
 
 
@@ -15625,6 +15935,44 @@ def _run_generation_dispatched(
     if response_id:
         request_observability_for_lane.setdefault("request_id", response_id)
     kwargs["request_observability"] = request_observability_for_lane
+    if request_capture.capture_dir() and not bool(
+        request_observability_for_lane.get("warmup")
+    ):
+        # Dispatch-time capture (#196/#197 third layer): persisted BEFORE any
+        # token is generated so a hung or early-stopped agent turn still
+        # leaves its bit-exact reproduction envelope on disk.
+        request_capture.capture_request(
+            request_observability_for_lane.get("request_id") or response_id,
+            {
+                "model_id": str(
+                    getattr(state.args, "model_id", None)
+                    or getattr(state, "model_id", None)
+                    or ""
+                ),
+                "prompt_len": len(prompt_ids),
+                "prompt_token_ids": [int(t) for t in prompt_ids],
+                "max_tokens": kwargs.get("max_tokens"),
+                "temperature": kwargs.get("temperature"),
+                "top_p": kwargs.get("top_p"),
+                "top_k": kwargs.get("top_k"),
+                "presence_penalty": kwargs.get("presence_penalty"),
+                "frequency_penalty": kwargs.get("frequency_penalty"),
+                "requested_seed": kwargs.get("seed"),
+                "generation_mode": str(effective_mode),
+                "depth": kwargs.get("depth"),
+                "session_id": kwargs.get("session_id"),
+                "session_restore_mode": kwargs.get("session_restore_mode"),
+                "has_constraint": kwargs.get("constraint_spec") is not None,
+                "tokenizer_template_hash": str(
+                    getattr(state, "main_system_prompt_hash", None) or ""
+                ),
+                "observability": {
+                    k: v
+                    for k, v in request_observability_for_lane.items()
+                    if isinstance(v, (str, int, float, bool))
+                },
+            },
+        )
     history_bypass_reason = _ar_batch_history_bypass_reason(
         request_observability_for_lane
     )
@@ -15793,6 +16141,7 @@ def _run_generation(
     streaming_response: bool | None = None,
     vision_splice: Any | None = None,
     constraint_spec: Any | None = None,
+    prefill_chunk_tokens: int | None = None,
 ) -> dict[str, Any]:
     response_max, sampler, generation_limits = _generation_params(
         state,
@@ -15905,7 +16254,14 @@ def _run_generation(
                 max_new_tokens=response_max,
                 mtp_depth=effective_depth,
             )
-            prefill_chunk_tokens = getattr(state.args, "prefill_chunk_tokens", None)
+            # Callers may tighten the prefill chunk for this generation
+            # (warming runs use a small chunk so their foreground-yield
+            # abort — checked once per chunk — fires fast); the serve-wide
+            # setting stays the default for real requests.
+            if prefill_chunk_tokens is None:
+                prefill_chunk_tokens = getattr(
+                    state.args, "prefill_chunk_tokens", None
+                )
             with _temporary_env(
                 dynamic_kv_reservation["env"]
             ), prefill_chunk_size_override(prefill_chunk_tokens):
@@ -16307,6 +16663,20 @@ def _run_generation(
                 ensure_ascii=False,
             )
         )
+    if request_capture.capture_dir():
+        request_capture.capture_outcome(
+            (request_observability or {}).get("request_id"),
+            {
+                "scheduler_lane": "serial",
+                "completion_tokens": last["completion_tokens"],
+                "finish_reason": last.get("finish_reason"),
+                "resolved_seed": last["stats"].get("server_seed"),
+                "attempts": last["stats"].get("server_attempts"),
+                "blank_retries": last["stats"].get("server_blank_retries"),
+                "tok_s": round(float(last["tok_s"]), 3),
+                **request_capture.clip_text_head_tail(last.get("text") or ""),
+            },
+        )
     return last
 
 
@@ -16537,6 +16907,18 @@ class _BackgroundWarmup:
         else:
             self._finish()
 
+    # Warming prefills must yield to real traffic quickly: the
+    # foreground-yield abort only fires once per prefill chunk, and the
+    # serve-wide 2048-token chunk holds the model lock ~3s per chunk on
+    # the 27B — a request arriving mid-warmup stalled exactly that long
+    # (measured 3.1-3.3s mid-turn freezes on the first turns of a fresh
+    # serve, 2026-07-31). A 256-token warming chunk bounds the wait to
+    # ~0.4s and lets preempted steps resume instead of burning the
+    # resubmit budget and abandoning. Passed as a _run_generation kwarg:
+    # the generation applies its own prefill_chunk_size_override
+    # internally, so an outer ContextVar wrapper would be clobbered.
+    WARMUP_PREFILL_CHUNK_TOKENS = 256
+
     def _ladder_generation(self, context_tokens: int) -> dict[str, Any]:
         repeats = context_tokens // max(1, len(self.prompt_ids)) + 1
         prompt_ids = (list(self.prompt_ids) * repeats)[:context_tokens]
@@ -16550,6 +16932,7 @@ class _BackgroundWarmup:
             seed=0,
             request_observability={"warmup": True, "warmup_background": True},
             cancel_event=_ForegroundYield(self.state),
+            prefill_chunk_tokens=self.WARMUP_PREFILL_CHUNK_TOKENS,
         )
 
     def _finish(self, abandoned: bool = False) -> None:
@@ -19514,6 +19897,28 @@ def _start_server_console(state: ServerState) -> None:
     thread.start()
 
 
+def _encoded_embedding(vector: list[float], encoding_format: str) -> Any:
+    """Return a vector in the representation the client asked for.
+
+    OpenAI's ``base64`` format is the raw float32 buffer, little-endian, which
+    is what clients decode with ``numpy.frombuffer(..., dtype="float32")``.
+    """
+    if encoding_format != "base64":
+        return vector
+    return base64.b64encode(struct.pack(f"<{len(vector)}f", *vector)).decode("ascii")
+
+
+def _as_text_list(value: Any, *, field: str) -> list[str]:
+    """Coerce an OpenAI-style text field into a list of strings."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return list(value)
+    raise HTTPException(
+        status_code=400, detail=f"{field} must be a string or a list of strings"
+    )
+
+
 def create_app(state: ServerState) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -19528,6 +19933,9 @@ def create_app(state: ServerState) -> FastAPI:
             bg_tasks.append(asyncio.create_task(_thermal_poll_loop(state)))
         if _memory_pressure_guard_enabled():
             bg_tasks.append(asyncio.create_task(_memory_pressure_loop(state)))
+        retrieval = getattr(state, "retrieval", None)
+        if retrieval is not None and retrieval.idle_timeout_s > 0:
+            bg_tasks.append(asyncio.create_task(_retrieval_idle_loop(state)))
         try:
             yield
         finally:
@@ -20886,19 +21294,120 @@ def create_app(state: ServerState) -> FastAPI:
     @app.get("/v1/models")
     def list_models() -> dict[str, Any]:
         now = int(time.time())
-        return {
+        entries: list[dict[str, Any]] = [
+            {
+                "id": state.model_id,
+                "object": "model",
+                "created": now,
+                "owned_by": "mtplx",
+                "capability": "chat",
+                "context_length": state.context_window,
+                "max_context_length": state.context_window,
+                "max_model_len": state.context_window,
+            }
+        ]
+        retrieval = getattr(state, "retrieval", None)
+        if retrieval is not None:
+            for descriptor in retrieval.descriptors():
+                entries.append(
+                    {
+                        "id": descriptor["id"],
+                        "object": "model",
+                        "created": now,
+                        "owned_by": "mtplx",
+                        "capability": descriptor["role"],
+                        "root": descriptor["model_ref"],
+                        "max_model_len": descriptor["max_tokens"],
+                    }
+                )
+        return {"object": "list", "data": entries}
+
+    @app.post("/v1/embeddings")
+    async def embeddings(request: EmbeddingsRequest) -> Response:
+        retrieval = getattr(state, "retrieval", None)
+        if retrieval is None or not retrieval.enabled:
+            raise HTTPException(
+                status_code=404,
+                detail="no embedding model is configured; start MTPLX with --embedding-model",
+            )
+        texts = _as_text_list(request.input, field="input")
+        encoding_format = str(request.encoding_format or "float").lower()
+        if encoding_format not in {"float", "base64"}:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"unsupported encoding_format {request.encoding_format!r}; "
+                    "expected 'float' or 'base64'"
+                ),
+            )
+        try:
+            vectors, spec, prompt_tokens = await asyncio.to_thread(
+                retrieval.embed,
+                texts,
+                model=request.model,
+                instruction=request.instruction,
+            )
+        except RetrievalError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        payload = {
             "object": "list",
             "data": [
                 {
-                    "id": state.model_id,
-                    "object": "model",
-                    "created": now,
-                    "owned_by": "mtplx",
-                    "context_length": state.context_window,
-                    "max_context_length": state.context_window,
-                    "max_model_len": state.context_window,
+                    "object": "embedding",
+                    "index": index,
+                    "embedding": _encoded_embedding(vector, encoding_format),
                 }
+                for index, vector in enumerate(vectors)
             ],
+            "model": spec.served_id,
+            # Real counts: clients use these for accounting and rate limits, so
+            # a fixed zero silently corrupts every retrieval total.
+            "usage": {"prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens},
+        }
+        # Serialise here rather than returning the dict. FastAPI would run
+        # jsonable_encoder over every float individually in Python, which costs
+        # roughly 30x the actual inference for a 4096-dim vector — measured at
+        # ~870 ms of encoding for ~31 ms of forward pass.
+        return Response(
+            content=json.dumps(payload, separators=(",", ":")),
+            media_type="application/json",
+        )
+
+    @app.post("/v1/rerank")
+    async def rerank(request: RerankRequest) -> dict[str, Any]:
+        retrieval = getattr(state, "retrieval", None)
+        if retrieval is None or not retrieval.enabled:
+            raise HTTPException(
+                status_code=404,
+                detail="no reranking model is configured; start MTPLX with --reranker-model",
+            )
+        if not request.query or not str(request.query).strip():
+            raise HTTPException(status_code=400, detail="query must be a non-empty string")
+        documents = _as_text_list(request.documents, field="documents")
+        try:
+            scores, spec, prompt_tokens = await asyncio.to_thread(
+                retrieval.rerank,
+                str(request.query),
+                documents,
+                model=request.model,
+                instruction=request.instruction,
+            )
+        except RetrievalError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        ranked = sorted(enumerate(scores), key=lambda item: item[1], reverse=True)
+        if request.top_n is not None and int(request.top_n) > 0:
+            ranked = ranked[: int(request.top_n)]
+        results: list[dict[str, Any]] = []
+        for index, score in ranked:
+            entry: dict[str, Any] = {"index": index, "relevance_score": score}
+            if request.return_documents:
+                entry["document"] = {"text": documents[index]}
+            results.append(entry)
+        return {
+            "id": f"rerank-{int(time.time() * 1000)}",
+            "model": spec.served_id,
+            "results": results,
+            "usage": {"total_tokens": prompt_tokens},
         }
 
     @app.post("/v1/chat/completions")
@@ -25625,6 +26134,43 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         postcommit_default = "async"
     parser.add_argument("--model", default=DEFAULT_HF_MODEL_ID)
     parser.add_argument("--model-id", default="mtplx-qwen36-27b-native-mtp")
+    parser.add_argument(
+        "--embedding-model",
+        action="append",
+        default=[],
+        metavar="REF[=SERVED_ID]",
+        help="Serve REF on /v1/embeddings (repeatable); loaded on first request",
+    )
+    parser.add_argument(
+        "--reranker-model",
+        action="append",
+        default=[],
+        metavar="REF[=SERVED_ID]",
+        help="Serve REF on /v1/rerank (repeatable); the same REF in both roles loads once",
+    )
+    parser.add_argument(
+        "--retrieval-max-resident",
+        type=int,
+        default=2,
+        help="How many retrieval models stay in memory; least-recently-used are unloaded",
+    )
+    parser.add_argument(
+        "--retrieval-max-tokens",
+        type=int,
+        default=0,
+        help="Truncate retrieval inputs to this many tokens (0 = per-model default)",
+    )
+    parser.add_argument(
+        "--retrieval-idle-timeout",
+        type=float,
+        default=0.0,
+        help="Unload retrieval models after this many idle seconds (0 = never)",
+    )
+    parser.add_argument(
+        "--retrieval-cache-dir",
+        default=None,
+        help="Model cache directory used to resolve retrieval references",
+    )
     parser.add_argument("--backend-id", default="qwen3_next", help=argparse.SUPPRESS)
     parser.add_argument(
         "--assistant-model",
@@ -25811,7 +26357,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--adaptive-policy",
-        choices=["none", "streak", "expected_value"],
+        choices=["none", "streak", "expected_value", "cost"],
         default="none",
         help="Optional per-request native-MTP depth policy. Exact sampler semantics remain unchanged.",
     )
