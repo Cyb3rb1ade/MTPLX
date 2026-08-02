@@ -110,6 +110,7 @@ from mtplx.runtime_options import (
     resolve_api_key,
 )
 from mtplx.draft_lm_head import _install_draft_lm_head
+from mtplx import request_capture
 from mtplx.fan_mode import (
     FAN_MODE_CHOICES,
     FAN_MODE_DEFAULT,
@@ -305,8 +306,15 @@ STREAM_SILENCE_WARN_INTERVAL_S = 60.0
 STREAM_STALL_DEADLINE_S = float(
     os.environ.get("MTPLX_STREAM_STALL_DEADLINE_S") or 300.0
 )
-STREAM_HIDDEN_TOOL_GUARD_TOKENS = 2048
-STREAM_HIDDEN_TOOL_GUARD_S = 30.0
+# Runaway-hidden-generation backstop. Native-tool agent workloads stream
+# multi-thousand-token arguments (whole files) as legitimate hidden text, so
+# the ceilings are env-tunable; the defaults keep the original chat-UX guard.
+STREAM_HIDDEN_TOOL_GUARD_TOKENS = int(
+    os.environ.get("MTPLX_STREAM_HIDDEN_TOOL_GUARD_TOKENS", "2048")
+)
+STREAM_HIDDEN_TOOL_GUARD_S = float(
+    os.environ.get("MTPLX_STREAM_HIDDEN_TOOL_GUARD_S", "30")
+)
 STREAM_TOOL_CALL_FINISH_GRACE_S = 0.05
 TOOL_PROTOCOL_BOUNDARY_GRACE_S = 0.05
 _REASONING_DETAILS_RE = re.compile(
@@ -1075,6 +1083,15 @@ def _startup_line(text: str = "") -> None:
     _safe_stdout_print(text)
 
 
+def _laguna_fused_startup_line(runtime: Any) -> str | None:
+    """Engagement receipt for the env-gated fused stack (grep: [laguna-fused])."""
+
+    report = getattr(runtime, "laguna_fused_report", None)
+    if not report:
+        return None
+    return "[5/6] [laguna-fused] " + json.dumps(report, ensure_ascii=False)
+
+
 def _startup_server_url(args: argparse.Namespace) -> str:
     return local_url_for_bind(
         str(getattr(args, "host", "127.0.0.1")),
@@ -1758,6 +1775,9 @@ class ServerState:
             _startup_line(
                 f"[5/6] {self.backend_descriptor.display_name} drafter is active"
             )
+        fused_line = _laguna_fused_startup_line(self.runtime)
+        if fused_line:
+            _startup_line(fused_line)
         if self.backend_descriptor.uses_draft_lm_head and self.runtime.mtp_enabled:
             self.draft_lm_head = self.model_scheduler.submit_foreground(
                 _install_draft_lm_head,
@@ -1886,7 +1906,8 @@ class ServerState:
         from mtplx.thermal import SmartFanController
 
         self.smart_fans = SmartFanController(
-            log=lambda line: LOGGER.info("%s", line)
+            log=lambda line: LOGGER.info("%s", line),
+            activity_probe=self._smart_fan_activity_probe,
         )
         # Dashboard primitives: pub/sub bus, in-flight registry, 5-min rolling
         # TPS window, lifetime counters, prefill history. Created before
@@ -1895,6 +1916,29 @@ class ServerState:
         self.dashboard = DashboardState()
         self.ar_batch_service = _BatchedARGenerationService(self)
         self.warmup_status = _run_startup_warmup(self)
+
+    def _smart_fan_activity_probe(self) -> bool:
+        """True while any model work is executing, queued, or recently active.
+
+        Feeds the SmartFanController stale-lease reconciler (#201). Covers
+        every legitimate work state: foreground generation (begin/end_foreground
+        wraps dispatch on all paths including the AR batch service), scheduler
+        queues and the executing item of either lane (foreground + idle
+        postcommit), and a short recency window so back-to-back agent turns
+        never look idle between requests.
+        """
+        if self.has_foreground():
+            return True
+        scheduler = getattr(self, "model_scheduler", None)
+        if scheduler is not None and hasattr(scheduler, "any_pending_or_active"):
+            try:
+                if scheduler.any_pending_or_active():
+                    return True
+            except BaseException:
+                return True
+        last_started = float(getattr(self, "last_request_started_at", 0.0) or 0.0)
+        last_finished = float(getattr(self, "last_request_at", 0.0) or 0.0)
+        return (time.time() - max(last_started, last_finished)) < 30.0
 
     def begin_foreground(self) -> None:
         with self.foreground_lock:
@@ -5106,7 +5150,11 @@ def _mtplx_pi_convergence_user_instruction_text() -> str:
         "context now. Use the evidence already gathered to edit, verify, or "
         "finish. The next response must not be another broad read/grep/find/ls "
         "or inspection-only shell command; only one narrow line-range refresh "
-        "is allowed when it is necessary to make the edit apply."
+        "is allowed when it is necessary to make the edit apply. Editing and "
+        "verification tools (edit/write/patch, or shell commands that run "
+        "tests or the build) remain fully allowed and are the expected next "
+        "step — this restriction covers broad inspection only, and it applies "
+        "to this reply only, not to the rest of the session."
     )
 
 
@@ -6353,6 +6401,137 @@ def _parse_poolside_tool_call(block: str) -> tuple[str, Any] | None:
     return name, arguments
 
 
+def _scan_bracket_tool_call(
+    text: str,
+    start: int,
+) -> tuple[int, str, Any] | None:
+    """Balanced-scan one `[Calling tool: name({...})]` block at `start`.
+
+    The JSON object is walked with string/escape awareness, so `}` or `)]`
+    sequences inside argument strings (a JS file body, a task_progress
+    checklist) cannot end the block early — the failure mode of the
+    non-greedy regex this replaces. Returns (end_exclusive, name, arguments)
+    for a complete block, or None when no complete well-formed block starts
+    at `start`.
+    """
+    match = re.compile(
+        r"\[(?:Calling tool|Tool call):\s*([A-Za-z_][\w.-]*)\s*\(",
+        re.IGNORECASE,
+    ).match(text, start)
+    if match is None:
+        return None
+    name = match.group(1)
+    i = match.end()
+    tail = re.compile(r"\s*\)\s*\]").match(text, i)
+    if tail is not None:
+        return tail.end(), name, {}
+    if i >= len(text) or text[i] != "{":
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    j = i
+    while j < len(text):
+        ch = text[j]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                j += 1
+                break
+        j += 1
+    if depth != 0:
+        return None
+    close = re.compile(r"\s*\)\s*\]").match(text, j)
+    if close is None:
+        return None
+    try:
+        arguments = json.loads(text[i:j])
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(arguments, dict):
+        return None
+    return close.end(), name, arguments
+
+
+def _classify_bracket_tool_call(text: str, start: int) -> str:
+    """Classify the bracket block starting at `start` (which sits on a full
+    `[Calling tool:`/`[Tool call:` prefix).
+
+    'complete'   — a well-formed call the scanner can extract now.
+    'incomplete' — the available text ends inside a structurally consistent
+                   block; more chunks may complete it (streaming: buffer).
+    'invalid'    — the structure is already broken with text to spare (e.g. a
+                   dangling prefix in prose); never a call, leave it to the
+                   content path and its prefix sanitizer.
+    """
+    if _scan_bracket_tool_call(text, start) is not None:
+        return "complete"
+    tail = text[start:]
+    head = re.match(
+        r"\[(?:Calling tool|Tool call):\s*[A-Za-z_][\w.-]*\s*\(",
+        tail,
+        re.IGNORECASE,
+    )
+    if head is None:
+        after_prefix = re.sub(
+            r"^\[(?:Calling tool|Tool call):",
+            "",
+            tail,
+            flags=re.IGNORECASE,
+        )
+        if re.fullmatch(r"\s*(?:[A-Za-z_][\w.-]*)?\s*\(?", after_prefix):
+            return "incomplete"
+        return "invalid"
+    i = start + head.end()
+    if i >= len(text):
+        return "incomplete"
+    if text[i] != "{":
+        return (
+            "incomplete"
+            if re.fullmatch(r"\s*\)?\s*\]?", text[i:])
+            else "invalid"
+        )
+    depth = 0
+    in_string = False
+    escaped = False
+    j = i
+    while j < len(text):
+        ch = text[j]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                j += 1
+                break
+        j += 1
+    if depth != 0:
+        return "incomplete"
+    # Object closed but the scanner rejected it: either the `)]` close is
+    # still arriving, or the payload is truly malformed.
+    return "incomplete" if re.fullmatch(r"\s*\)?\s*", text[j:]) else "invalid"
+
+
 def _tool_marker_pairs_from_tokenizer(tokenizer: Any | None) -> list[tuple[str, str]]:
     if tokenizer is None:
         return []
@@ -6384,19 +6563,33 @@ def _iter_generated_tool_call_envelopes(
         )
         for match in pattern.finditer(text):
             envelopes.append((match.start(), match.end(), match.group(1).strip(), None))
-    for match in _BRACKET_TOOL_CALL_RE.finditer(text):
-        name = match.group(1).strip()
-        raw_args = (match.group(2) or "").strip()
-        if raw_args:
-            try:
-                arguments: Any = json.loads(raw_args)
-            except json.JSONDecodeError as exc:
-                raise _tool_protocol_error(
-                    f"bracket tool_call '{name}' arguments are not valid JSON"
-                ) from exc
-        else:
-            arguments = {}
-        envelopes.append((match.start(), match.end(), "", (name, arguments)))
+    # Bracket dialect (`[Calling tool: name({...})]`) via the balanced scanner:
+    # the old non-greedy regex ended the block at the first `})]`, which any
+    # code-file argument contains inside a string, so large bracket calls
+    # always failed JSON decode and fell back to prose.
+    search_from = 0
+    lowered_text = text.lower()
+    while True:
+        candidates = [
+            idx
+            for idx in (
+                lowered_text.find(prefix.lower(), search_from)
+                for prefix in _BRACKET_TOOL_PREFIXES
+            )
+            if idx >= 0
+        ]
+        if not candidates:
+            break
+        found = min(candidates)
+        scanned = _scan_bracket_tool_call(text, found)
+        if scanned is None:
+            # Unterminated or malformed: not an envelope — the text stays
+            # visible content, same terminal state as the old decode error.
+            search_from = found + 1
+            continue
+        end, name, arguments = scanned
+        envelopes.append((found, end, "", (name, arguments)))
+        search_from = end
     envelopes.sort(key=lambda item: item[0])
     for previous, current in zip(envelopes, envelopes[1:]):
         if current[0] < previous[1]:
@@ -6515,23 +6708,28 @@ def _parse_generated_tool_calls(
             raise _tool_protocol_error("unsupported tool_call payload format")
         name, arguments = parsed
         canonical_name = _canonical_tool_name_for_model_output(name, tools)
-        if canonical_name is None:
-            raise _tool_protocol_error(f"unknown tool '{name}'")
         arguments_value = _json_object_value(
             arguments,
             context=f"tool_call[{index}]",
         )
-        arguments_value = _normalize_tool_arguments_for_schema(
-            tool_name=canonical_name,
-            arguments=arguments_value,
-            tools=tools,
-        )
-        _validate_tool_arguments_for_schema(
-            tool_name=canonical_name,
-            arguments=arguments_value,
-            tools=tools,
-            context=f"tool_call[{index}]",
-        )
+        if canonical_name is None:
+            # OpenAI-compatible pass-through: surface the call under its raw
+            # name and let the client own the unknown-tool rejection (the
+            # client answers the model, which self-corrects). There is no
+            # schema to normalize or validate against.
+            canonical_name = str(name)
+        else:
+            arguments_value = _normalize_tool_arguments_for_schema(
+                tool_name=canonical_name,
+                arguments=arguments_value,
+                tools=tools,
+            )
+            _validate_tool_arguments_for_schema(
+                tool_name=canonical_name,
+                arguments=arguments_value,
+                tools=tools,
+                context=f"tool_call[{index}]",
+            )
         calls.append(
             {
                 "id": f"call_{uuid.uuid4().hex[:24]}",
@@ -6841,8 +7039,8 @@ class _QwenXMLToolCallStreamParser(_ToolCallStreamParser):
                     self._tools,
                 )
                 if canonical_name is None:
-                    self._fallback_reason = f"unknown tool '{name}'"
-                    return deltas
+                    # Pass-through: the client owns unknown-tool rejection.
+                    canonical_name = name
                 self._name = canonical_name
                 self._started = True
                 self._buf = self._buf[function_end + 1 :]
@@ -7271,12 +7469,16 @@ class _ToolAwareContentStreamTranslator:
         for prefix in _BRACKET_TOOL_PREFIXES:
             bracket_idx = lowered.find(prefix.lower())
             while bracket_idx >= 0:
-                candidate = text[bracket_idx:]
-                if _BRACKET_TOOL_CALL_RE.match(candidate):
+                # The old gate demanded a complete regex match mid-stream and
+                # skipped ahead on any early `]` (present in every
+                # task_progress checklist), so bracket-call text streamed to
+                # the client as content AND the finish-time rescue emitted the
+                # same call — a double delivery that also taught the model its
+                # drift dialect was accepted. Buffer on complete AND
+                # still-completing blocks; only structurally-dead prefixes
+                # stay on the content path for the prefix sanitizer.
+                if _classify_bracket_tool_call(text, bracket_idx) != "invalid":
                     candidates.append(bracket_idx)
-                    break
-                close_idx = candidate.find("]")
-                if close_idx < 0:
                     break
                 bracket_idx = lowered.find(prefix.lower(), bracket_idx + 1)
         for start_marker, _end_marker in self._marker_pairs:
@@ -10338,12 +10540,49 @@ def _count_text_tokens(tokenizer: Any, text: str) -> int:
 _REQUEST_LOG_LOCK = threading.Lock()
 
 
+_REQUEST_LOG_MAX_BYTES = 64 * 1024 * 1024
+_REQUEST_LOG_KEEP_GENERATIONS = 4
+
+
 def _request_log_path(state: "ServerState") -> str | None:
     raw = getattr(state.args, "request_log_jsonl", None) or os.environ.get(
         "MTPLX_REQUEST_LOG_JSONL"
     )
     raw = str(raw or "").strip()
-    return raw or None
+    if raw.lower() in {"0", "off", "false", "no", "none", "disabled"}:
+        return None
+    if raw:
+        return raw
+    # Default ON: agent-session incidents cannot be diagnosed after the fact
+    # without a durable per-request trail. Records are numeric/hash telemetry
+    # only — no prompt or completion content — size-capped by rotation below,
+    # and disabled with MTPLX_REQUEST_LOG_JSONL=off. Per-port files so
+    # parallel serves never interleave. Live forensics repeatedly stalled on
+    # the 15-entry RAM ring; this keeps the durable trail by default.
+    try:
+        port = int(getattr(state.args, "port", 0) or 0)
+        log_dir = os.path.join(os.path.expanduser("~"), ".mtplx", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        return os.path.join(log_dir, f"request-log-{port}.jsonl")
+    except Exception:
+        return None
+
+
+def _rotate_request_log_if_needed(path: str) -> None:
+    """Cascade path -> .1 -> .2 ... keeping a bounded on-disk history."""
+    try:
+        if os.path.getsize(path) < _REQUEST_LOG_MAX_BYTES:
+            return
+    except OSError:
+        return
+    try:
+        for gen in range(_REQUEST_LOG_KEEP_GENERATIONS - 1, 0, -1):
+            older = f"{path}.{gen}"
+            if os.path.exists(older):
+                os.replace(older, f"{path}.{gen + 1}")
+        os.replace(path, f"{path}.1")
+    except OSError:
+        pass
 
 
 def _record_request_metrics(state: "ServerState", record: dict[str, Any]) -> None:
@@ -10369,6 +10608,7 @@ def _record_request_metrics(state: "ServerState", record: dict[str, Any]) -> Non
             default=str,
         )
         with _REQUEST_LOG_LOCK:
+            _rotate_request_log_if_needed(path)
             with open(path, "a", encoding="utf-8") as sink:
                 sink.write(line + "\n")
     except Exception:
@@ -14183,6 +14423,10 @@ def _adaptive_config(
                 "decrease_after": int(args.adaptive_decrease_after),
             }
         )
+    elif policy == "cost":
+        config["marginal_ms_prior"] = float(
+            getattr(args, "adaptive_cost_marginal_ms", 7.0) or 7.0
+        )
     elif policy == "expected_value":
         configured_base_depth = max(1, int(args.adaptive_ev_base_depth))
         effective_base_depth = max(
@@ -14237,6 +14481,17 @@ def _make_adaptive_policy(
             start_depth=int(args.adaptive_start_depth),
             increase_after=int(args.adaptive_increase_after),
             decrease_after=int(args.adaptive_decrease_after),
+        )
+    if policy == "cost":
+        from mtplx.adaptive import CostModelDepthPolicy
+
+        return CostModelDepthPolicy(
+            max_depth=effective_max_depth,
+            min_depth=effective_min_depth,
+            marginal_ms=float(
+                getattr(args, "adaptive_cost_marginal_ms", 0.0) or 0.0
+            )
+            or None,
         )
     if policy == "expected_value":
         effective_base_depth = max(
@@ -14867,6 +15122,30 @@ _IDLE_POSTCOMMIT_MAX_WAIT_S = 30.0
 _IDLE_POSTCOMMIT_POLL_INTERVAL_S = 0.25
 
 
+def _idle_postcommit_foreground_grace_s() -> float:
+    """Bounded window during which a running postcommit finishes despite a
+    queued foreground request.
+
+    2026-08-01 live gauntlet receipts: in a real OpenCode tool loop the next
+    request arrives within ~0.5s of the previous response, so EVERY
+    tool_call_history_rewrite postcommit was preempted
+    (foreground_preempted_postcommit x6 in one 8-turn run) and every
+    tool-turn paid a 2-4k-token block-salvage re-prefill instead (3-7s of
+    TTFT). The commit itself starts from the live cache and typically
+    finishes well under this grace, so letting it win delays the queued
+    request by at most the grace while removing the far larger salvage.
+    0 restores strict immediate-yield (the 2026-07-02 starvation semantics,
+    still guarded as bounded by this cap in the yield test).
+    """
+    raw = os.environ.get("MTPLX_POSTCOMMIT_FOREGROUND_GRACE_S")
+    if raw is None or not str(raw).strip():
+        return 2.0
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return 2.0
+
+
 def _schedule_idle_postcommit_snapshot(
     state: ServerState,
     *,
@@ -14897,6 +15176,23 @@ def _schedule_idle_postcommit_snapshot(
     rechecks that no newer foreground is queued and that the session did not
     advance before it builds a new cache.
     """
+    if unsafe_reason == "tool_call_history_rewrite" and str(
+        os.environ.get("MTPLX_IDLE_POSTCOMMIT_TOOL_REWRITE", "1")
+    ).strip().lower() in {"0", "false", "off", "no"}:
+        # 2026-08-01 gauntlet: on the OpenCode hybrid tool lane this commit's
+        # canonical retokenization matched NEITHER the generation stream NOR
+        # the next request's bytes (its own bank lookup found ~no prefix), so
+        # it re-forwarded the full 27-29k history in the gap, never stored
+        # (aborted on the next request, one after 26.8s of GPU), and the
+        # foreground grace then delayed the queued request for doomed work.
+        # This is the "postcommit ghost re-prefill" pathology. Kill switch until
+        # the hybrid-lane canonical rendering is byte-proven against real
+        # next-turn prompts; store-on-prefill + block salvage remain.
+        return {
+            "stored": False,
+            "mode": "disabled",
+            "reason": "tool_rewrite_postcommit_disabled",
+        }
     pending = {
         "stored": False,
         "mode": "async_pending",
@@ -14957,10 +15253,24 @@ def _schedule_idle_postcommit_snapshot(
             and int(observed) != int(expected_session_revision)
         )
 
+    # Foreground pressure only aborts the commit after the bounded grace
+    # (anchored when the job actually starts); explicit aborts and stale
+    # session revisions stay immediate.
+    grace_s = _idle_postcommit_foreground_grace_s()
+    job_started_holder: dict[str, float] = {}
+
+    def _foreground_pressure_past_grace() -> bool:
+        if not _foreground_model_work_pending(state):
+            return False
+        started_at = job_started_holder.get("t")
+        if started_at is None:
+            return True
+        return (time.monotonic() - started_at) > grace_s
+
     def _postcommit_abort_reason() -> str:
         if _stale_session_revision():
             return "stale_session_revision"
-        if abort_event.is_set() or _foreground_model_work_pending(state):
+        if abort_event.is_set() or _foreground_pressure_past_grace():
             return "foreground_preempted_postcommit"
         return "postcommit_abort_requested"
 
@@ -14968,7 +15278,7 @@ def _schedule_idle_postcommit_snapshot(
         return bool(
             abort_event.is_set()
             or _stale_session_revision()
-            or _foreground_model_work_pending(state)
+            or _foreground_pressure_past_grace()
         )
 
     # The postcommit re-prefills the conversation at full GPU load after the
@@ -14984,6 +15294,7 @@ def _schedule_idle_postcommit_snapshot(
 
     def async_postcommit() -> None:
         deadline = time.monotonic() + _IDLE_POSTCOMMIT_MAX_WAIT_S
+        job_started_holder["t"] = time.monotonic()
         record = pending_record_holder.get("record")
         if record is not None and hasattr(record, "mark_started"):
             try:
@@ -15004,13 +15315,16 @@ def _schedule_idle_postcommit_snapshot(
                         }
                     )
                     return
-                if abort_event.is_set() or _foreground_model_work_pending(state):
-                    # Yield to queued foreground: return to free the single
-                    # model worker (a sleep+retry here would starve the
-                    # foreground request behind us — regression caught by
+                if abort_event.is_set() or _foreground_pressure_past_grace():
+                    # Yield to queued foreground once the bounded grace is
+                    # spent: return to free the single model worker (an
+                    # unbounded sleep+retry here would starve the foreground
+                    # request behind us — regression caught by
                     # test_running_idle_postcommit_yields_to_queued_foreground,
-                    # 2026-07-02). Warming the next agent turn is handled by
-                    # store-on-prefill instead, which needs no idle gap.
+                    # 2026-07-02; the grace keeps the delay bounded while
+                    # letting agent-loop tool-turn commits actually land —
+                    # 2026-08-01 gauntlet receipts). Store-on-prefill remains
+                    # the fallback warmer when the commit loses.
                     _log(
                         {
                             "stored": False,
@@ -15507,6 +15821,18 @@ def _finalize_batched_ar_generation(
                 ensure_ascii=False,
             )
         )
+    if request_capture.capture_dir():
+        request_capture.capture_outcome(
+            (request_observability or {}).get("request_id"),
+            {
+                "scheduler_lane": "ar_batch",
+                "completion_tokens": completion_tokens,
+                "finish_reason": generated.get("finish_reason"),
+                "resolved_seed": stats.get("server_seed"),
+                "tok_s": round(float(generated.get("tok_s") or 0.0), 3),
+                **request_capture.clip_text_head_tail(generated.get("text") or ""),
+            },
+        )
     return generated
 
 
@@ -15625,6 +15951,44 @@ def _run_generation_dispatched(
     if response_id:
         request_observability_for_lane.setdefault("request_id", response_id)
     kwargs["request_observability"] = request_observability_for_lane
+    if request_capture.capture_dir() and not bool(
+        request_observability_for_lane.get("warmup")
+    ):
+        # Dispatch-time capture (#196/#197 third layer): persisted BEFORE any
+        # token is generated so a hung or early-stopped agent turn still
+        # leaves its bit-exact reproduction envelope on disk.
+        request_capture.capture_request(
+            request_observability_for_lane.get("request_id") or response_id,
+            {
+                "model_id": str(
+                    getattr(state.args, "model_id", None)
+                    or getattr(state, "model_id", None)
+                    or ""
+                ),
+                "prompt_len": len(prompt_ids),
+                "prompt_token_ids": [int(t) for t in prompt_ids],
+                "max_tokens": kwargs.get("max_tokens"),
+                "temperature": kwargs.get("temperature"),
+                "top_p": kwargs.get("top_p"),
+                "top_k": kwargs.get("top_k"),
+                "presence_penalty": kwargs.get("presence_penalty"),
+                "frequency_penalty": kwargs.get("frequency_penalty"),
+                "requested_seed": kwargs.get("seed"),
+                "generation_mode": str(effective_mode),
+                "depth": kwargs.get("depth"),
+                "session_id": kwargs.get("session_id"),
+                "session_restore_mode": kwargs.get("session_restore_mode"),
+                "has_constraint": kwargs.get("constraint_spec") is not None,
+                "tokenizer_template_hash": str(
+                    getattr(state, "main_system_prompt_hash", None) or ""
+                ),
+                "observability": {
+                    k: v
+                    for k, v in request_observability_for_lane.items()
+                    if isinstance(v, (str, int, float, bool))
+                },
+            },
+        )
     history_bypass_reason = _ar_batch_history_bypass_reason(
         request_observability_for_lane
     )
@@ -15793,6 +16157,7 @@ def _run_generation(
     streaming_response: bool | None = None,
     vision_splice: Any | None = None,
     constraint_spec: Any | None = None,
+    prefill_chunk_tokens: int | None = None,
 ) -> dict[str, Any]:
     response_max, sampler, generation_limits = _generation_params(
         state,
@@ -15905,7 +16270,14 @@ def _run_generation(
                 max_new_tokens=response_max,
                 mtp_depth=effective_depth,
             )
-            prefill_chunk_tokens = getattr(state.args, "prefill_chunk_tokens", None)
+            # Callers may tighten the prefill chunk for this generation
+            # (warming runs use a small chunk so their foreground-yield
+            # abort — checked once per chunk — fires fast); the serve-wide
+            # setting stays the default for real requests.
+            if prefill_chunk_tokens is None:
+                prefill_chunk_tokens = getattr(
+                    state.args, "prefill_chunk_tokens", None
+                )
             with _temporary_env(
                 dynamic_kv_reservation["env"]
             ), prefill_chunk_size_override(prefill_chunk_tokens):
@@ -16307,6 +16679,20 @@ def _run_generation(
                 ensure_ascii=False,
             )
         )
+    if request_capture.capture_dir():
+        request_capture.capture_outcome(
+            (request_observability or {}).get("request_id"),
+            {
+                "scheduler_lane": "serial",
+                "completion_tokens": last["completion_tokens"],
+                "finish_reason": last.get("finish_reason"),
+                "resolved_seed": last["stats"].get("server_seed"),
+                "attempts": last["stats"].get("server_attempts"),
+                "blank_retries": last["stats"].get("server_blank_retries"),
+                "tok_s": round(float(last["tok_s"]), 3),
+                **request_capture.clip_text_head_tail(last.get("text") or ""),
+            },
+        )
     return last
 
 
@@ -16537,6 +16923,18 @@ class _BackgroundWarmup:
         else:
             self._finish()
 
+    # Warming prefills must yield to real traffic quickly: the
+    # foreground-yield abort only fires once per prefill chunk, and the
+    # serve-wide 2048-token chunk holds the model lock ~3s per chunk on
+    # the 27B — a request arriving mid-warmup stalled exactly that long
+    # (measured 3.1-3.3s mid-turn freezes on the first turns of a fresh
+    # serve, 2026-07-31). A 256-token warming chunk bounds the wait to
+    # ~0.4s and lets preempted steps resume instead of burning the
+    # resubmit budget and abandoning. Passed as a _run_generation kwarg:
+    # the generation applies its own prefill_chunk_size_override
+    # internally, so an outer ContextVar wrapper would be clobbered.
+    WARMUP_PREFILL_CHUNK_TOKENS = 256
+
     def _ladder_generation(self, context_tokens: int) -> dict[str, Any]:
         repeats = context_tokens // max(1, len(self.prompt_ids)) + 1
         prompt_ids = (list(self.prompt_ids) * repeats)[:context_tokens]
@@ -16550,6 +16948,7 @@ class _BackgroundWarmup:
             seed=0,
             request_observability={"warmup": True, "warmup_background": True},
             cancel_event=_ForegroundYield(self.state),
+            prefill_chunk_tokens=self.WARMUP_PREFILL_CHUNK_TOKENS,
         )
 
     def _finish(self, abandoned: bool = False) -> None:
@@ -25811,7 +26210,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--adaptive-policy",
-        choices=["none", "streak", "expected_value"],
+        choices=["none", "streak", "expected_value", "cost"],
         default="none",
         help="Optional per-request native-MTP depth policy. Exact sampler semantics remain unchanged.",
     )
@@ -25933,9 +26332,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help=(
             "Append every per-request telemetry record (the dashboard "
-            "'recent' schema) as one JSON line to this path. The durable "
+            "'recent' schema; numeric/hash fields only, no prompt or "
+            "completion content) as one JSON line to this path. The durable "
             "twin of the 100-entry RAM ring; scripts/session_forensics.py "
-            "reads it. Env: MTPLX_REQUEST_LOG_JSONL."
+            "reads it. Default: ON at ~/.mtplx/logs/request-log-<port>.jsonl "
+            "with 64MB x4 rotation; pass 'off' (or set "
+            "MTPLX_REQUEST_LOG_JSONL=off) to disable. Env: "
+            "MTPLX_REQUEST_LOG_JSONL."
         ),
     )
     parser.add_argument(
@@ -26096,8 +26499,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--open-dashboard",
         action="store_true",
         help=(
-            "Open the live MTPLX dashboard (/dashboard) after startup "
-            "instead of the chat UI."
+            "Open the live MTPLX dashboard (/dashboard) after startup, "
+            "alongside any client UI selected by --open-browser."
         ),
     )
     parser.add_argument(
